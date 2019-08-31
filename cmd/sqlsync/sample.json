@@ -1,0 +1,86 @@
+{
+	"Source": {
+		"Type": "mssql",
+		"Host": "mergi.skinner.com",
+		"Failover": "jiffy.skinner.com",
+		"DB": "DWH",
+		"User": "poster",
+		"Password": "ktdEgHixyMg5"
+	},
+	"Target": {
+		"Type": "postgres",
+		"Host": "descuento.chalmers.com",
+		"DB": "descuento_db",
+		"User": "postgres",
+		"Password": "postgres"
+	},
+	"Sync": [	
+		{
+			"Period": "30s",
+			"Origin": "Coupons.CouponType_Get",
+			"Dest": ["coupons.coupon_type_ins"],
+			"Params": [ "rv=rv" ],
+			"RowProc": [
+				{
+					"Condition":"@.id==@.id", 
+					"Sync": [
+						{
+							"Origin": "Coupons.Coupons_Get",
+							"Dest": ["coupons.coupon_ins"],
+							"Params": [ "wctype_id=id" ],
+							"Mapping":{
+								"coupon_key": "coupon_key",
+								"@wctype_id": "type_id",
+								"wbuser_id": "user_id"
+							}
+						}
+					]
+				}
+			],
+			"Mapping":{
+				"wctype_id": "id",
+				"coupon_cod": "alias",
+				"wcoupon_name": "coupon_name",
+				"wcoupon_descr": "coupon_descr",
+				"wc_const_discount": "const_discount",
+				"forWBs": "for_wb",
+				"country_map": "country_map",
+				"apptype": "app_type",
+				"paytypes": "pay_type",
+				"n": "n",
+				"m": "m",
+				"multi": "is_multi",
+				"wc_start": "start_date",
+				"wc_end": "end_date",
+				"wc_sale": "sale",
+				"rv": "rv",
+				"icon_ignore": "allow_icon",
+				"multi_oneorder": "is_multi_oneorder",
+				"minsum": "min_sum",
+				"goods_price": "is_minsum_per_item",
+				"delivery_type": "delivery_type_map",
+				"brandsBin": "brands",
+				"promoBin": "promos",
+				"banBrandBin": "brands_banned",
+				"banPromoBin": "promos_banned",
+				"geoBin": "zones",
+				"corpclient_id": "corp_id",
+				"show_in_catalog": "in_catalog",
+				"show_in_offer": "in_offer",
+				"banShowBrandBin": "hide_brands",
+				"banShowPromoBin": "hide_promos",
+				"discount_range_bin": "range",
+				"basket_auto_apply": "auto_apply",
+				"office_warehouses_bin": "warehouses",
+				"fix_price": "fixed_price",
+				"chrt_ids": "chrt_ids",
+				"site_text": "site_text",
+				"is_cart_range": "is_range_count",
+				"banShowUnauthorised": "for_auth_user",
+				"order_count": "order_count",
+				"badge": "badge",
+				"is_balanced": "is_balanced"
+			}
+		}
+	]
+}
