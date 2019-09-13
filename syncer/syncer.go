@@ -1,14 +1,16 @@
 package syncer
 
 import (
+	"context"
 	"database/sql"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
-	"regexp"
 	"strconv"
+	"strings"
+	"time"
 
 	"github.com/bhmj/jsonslice"
 	"github.com/bhmj/sqlsync/model"
@@ -16,80 +18,89 @@ import (
 	_ "github.com/lib/pq"                // Postgres driver
 )
 
-var validParam *regexp.Regexp
+type processor func(ctx context.Context, src *sql.DB, dst *sql.DB, pair *model.SyncPair, level int, quiet bool) error
 
-func init() {
-	validParam = regexp.MustCompile(`^([A-za-z_]+)=([A-za-z_]+)$`)
-}
-
-type processor func(src *sql.DB, dst *sql.DB, pair *model.SyncPair, level int) error
-
-func identPrintf(level int, format string, a ...interface{}) {
-	v := append([]interface{}{"- "}, a...)
-	fmt.Printf("%"+strconv.Itoa(level*2)+"s"+format, v...)
+func identPrintf(level int, format string, a ...interface{}) (str string) {
+	for i := 0; i < level*2; i++ {
+		str += fmt.Sprintf("  ")
+	}
+	str += fmt.Sprintf(" - ")
+	str += fmt.Sprintf(format, a...)
+	return
 }
 
 // DoSync ...
-func DoSync(pair *model.SyncPair) {
-	process(pair, doSync)
+func DoSync(ctx context.Context, pair *model.SyncPair, quiet bool) {
+	pair.Lock()
+	process(ctx, pair, doSync, quiet)
+	pair.Unlock()
 }
 
 // Init ...
 func Init(pair *model.SyncPair) {
-	process(pair, doInit)
+	process(context.Background(), pair, doInit, false)
 }
 
-func process(pair *model.SyncPair, fn processor) error {
+func process(ctx context.Context, pair *model.SyncPair, fn processor, quiet bool) error {
 
 	srcType := *pair.Source.Type
 	dstType := *pair.Target.Type
+	if srcType == "mssql" {
+		srcType = "sqlserver"
+	}
+	if dstType == "mssql" {
+		dstType = "sqlserver"
+	}
 
 	src, err := sql.Open(srcType, pair.SourceLink.ConnString)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error in %s: %s\n", *pair.Origin, err.Error())
+		fmt.Fprintf(os.Stderr, "\nerror in %s: %s\n", *pair.Origin, err.Error())
 		return err
 	}
 	defer src.Close()
 
 	dst, err := sql.Open(dstType, pair.TargetLink.ConnString)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error in %s: %s\n", *pair.Origin, err.Error())
+		fmt.Fprintf(os.Stderr, "\nerror in %s: %s\n", *pair.Origin, err.Error())
 		return err
 	}
 	defer dst.Close()
 
-	err = fn(src, dst, pair, 0)
+	err = fn(ctx, src, dst, pair, 0, quiet)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error processing query in %s: %s\n", *pair.Origin, err.Error())
+		fmt.Fprintf(os.Stderr, "\n%s: %s\n", *pair.Origin, err.Error())
 	}
 	return err
 }
 
-func doSync(src *sql.DB, dst *sql.DB, pair *model.SyncPair, level int) (err error) {
+func doSync(ctx context.Context, src *sql.DB, dst *sql.DB, pair *model.SyncPair, level int, quiet bool) (err error) {
 	//dstType := *pair.Target.Type
 
-	rows, err := src.Query(buildQuery(pair))
+	query, qargs, outs := buildQuery(pair)
+	rows, err := src.QueryContext(ctx, query, qargs...)
 	if err != nil {
 		return
 	}
 	defer rows.Close()
 
-	pv := pair.ParamValues
+	pv := make([]model.ColumnParamValue, len(pair.ColumnParam))
+	copy(pv, pair.ColumnParam)
 
-	fmt.Println("")
 	args := ""
-	for k, v := range pv {
+	for _, t := range pv {
 		if len(args) > 0 {
 			args += ", "
 		}
-		args += "@" + k + "=" + strconv.FormatInt(v, 10)
+		args += "@" + t.Param + "=" + strconv.FormatInt(t.Value, 10)
 	}
-	identPrintf(level, "%s %s", *pair.Origin, args)
+	msg := "\n" + identPrintf(level, "%s %s  [0]: ", *pair.Origin, args)
 
+	recs := 0
 	recordset := 0
 	for {
-		mapper, err := NewMapper(rows, pair.Mapping, pair.ParamValues)
+		mapper, err := NewMapper(rows, pair.Mapping, pair.ColumnParam)
 		if err != nil {
+			fmt.Print(msg)
 			return err
 		}
 
@@ -99,28 +110,35 @@ func doSync(src *sql.DB, dst *sql.DB, pair *model.SyncPair, level int) (err erro
 		for rows.Next() {
 			err = rows.Scan(mapper.Vals...)
 			if err != nil {
+				fmt.Print(msg)
 				return err
 			}
 			nrows++
 			// update RVs
-			for k, v := range pv {
-				nv := mapper.int64ByName(pair.ParamColumn[k])
-				if nv > v {
-					pv[k] = nv
+			for i := range pv { // source col, RV
+				nv := mapper.int64ByName(pv[i].Column)
+				if nv > pv[i].Value {
+					pv[i].Value = nv
 				}
 			}
 			// process data
 			if len(pair.RowProc) > 0 {
 				// process row
-				storeData(dst, pair, recordset, []interface{}{mapper.getRow()}, pv)
+				fmt.Print(msg)
+				msg = ""
+				err = storeData(ctx, src, dst, pair, recordset, []interface{}{mapper.getRow()}, pv)
+				if err != nil {
+					return err
+				}
+				// call row proc(s)
 				for p := 0; p < len(pair.RowProc); p++ {
-					side := &pair.RowProc[p]
-					if side.Condition != "" {
+					proc := &pair.RowProc[p]
+					if proc.Condition != "" {
 						js, err := json.Marshal(mapper.getRow())
 						if err != nil {
 							return err
 						}
-						cond := "$[?(" + side.Condition + ")]"
+						cond := "$[?(" + proc.Condition + ")]"
 						result, err := jsonslice.Get([]byte("["+string(js)+"]"), cond)
 						if err != nil {
 							return err
@@ -129,57 +147,83 @@ func doSync(src *sql.DB, dst *sql.DB, pair *model.SyncPair, level int) (err erro
 							continue
 						}
 					}
-					for i := 0; i < len(side.Sync); i++ {
-						sp := &side.Sync[i]
-						if sp.ParamValues == nil {
-							sp.ParamValues = make(map[string]int64)
+					for i := 0; i < len(proc.Sync); i++ {
+						sp := &proc.Sync[i]
+						// set proc params
+						for ip := 0; ip < len(sp.ColumnParam); ip++ {
+							val := mapper.int64ByName(sp.ColumnParam[ip].Column)
+							sp.ColumnParam[ip].Value = val // real deal
 						}
-						// set params
-						for ip := 0; ip < len(sp.Params); ip++ {
-							prm := validParam.FindStringSubmatch(sp.Params[ip])
-							val := mapper.int64ByName(prm[2])
-							sp.ParamValues[prm[1]] = val // real deal
-						}
-						err := doSync(src, dst, sp, level+1) // nested
+						err := doSync(ctx, src, dst, sp, level+1, quiet) // nested
 						if err != nil {
 							return err
 						}
 					}
 				}
+				// store RV
+				err = storeRV(ctx, src, dst, pair, pv)
+				if err != nil {
+					fmt.Print(msg)
+					return err
+				}
 			} else {
 				heap = append(heap, mapper.copyRow())
 			}
+		} // for rows.Next()
+		err = rows.Err()
+		if err != nil {
+			fmt.Print(msg)
+			return err
 		}
-		fmt.Printf(" : %d", nrows)
-		if len(heap) > 0 {
-			if nrows > 10000 {
-				print("")
+		// output params
+		for i := 0; i < len(pv); i++ {
+			if pv[i].Output && pv[i].Value < outs[i] {
+				pv[i].Value = outs[i]
 			}
-			storeData(dst, pair, recordset, heap, pv)
 		}
+
+		msg += fmt.Sprintf("%d", nrows)
+		if len(heap) > 0 {
+			recs++
+			err = storeData(ctx, src, dst, pair, recordset, heap, pv)
+			if err != nil {
+				return err
+			}
+		}
+
+		err = storeRV(ctx, src, dst, pair, pv)
+		if err != nil {
+			return err
+		}
+
 		if !rows.NextResultSet() {
 			break
 		}
 		recordset++
-		fmt.Println("")
-		identPrintf(level, "recordset %d\n", recordset)
+		msg += fmt.Sprintf("  [%d]: ", recordset)
+	} // forever
+
+	copy(pair.ColumnParam, pv)
+	if recs > 0 && !quiet {
+		fmt.Print(msg)
 	}
-
-	pair.ParamValues = pv
-
 	return
 }
 
-func doInit(src *sql.DB, dst *sql.DB, pair *model.SyncPair, level int) error {
-	tbl := "sync.sqlsync"
-	if pair.SyncTable != nil {
-		tbl = *pair.SyncTable
-	}
+func doInit(ctx context.Context, src *sql.DB, dst *sql.DB, pair *model.SyncPair, level int, quiet bool) error {
 	ph := "?"
 	if *pair.Target.Type == "postgres" {
 		ph = "$1"
 	}
-	rows, err := dst.Query("select * from "+tbl+" where tbl = "+ph, *pair.Origin)
+	var sync *sql.DB
+	if pair.SyncTableSide == "src" {
+		sync = src
+	} else {
+		sync = dst
+	}
+
+	query := "select * from " + *pair.SyncTable + " where tbl = " + ph
+	rows, err := sync.QueryContext(ctx, query, *pair.Origin)
 	if err != nil {
 		return err
 	}
@@ -190,14 +234,6 @@ func doInit(src *sql.DB, dst *sql.DB, pair *model.SyncPair, level int) error {
 		return err
 	}
 
-	pair.ParamValues = make(map[string]int64)
-	pair.ParamColumn = make(map[string]string)
-	for p := 0; p < len(pair.Params); p++ {
-		prm := validParam.FindStringSubmatch(pair.Params[p])
-		pair.ParamValues[prm[1]] = 0 // init with 0
-		pair.ParamColumn[prm[1]] = prm[2]
-	}
-
 	for rows.Next() {
 		err = rows.Scan(mapper.Vals...)
 		if err != nil {
@@ -205,11 +241,10 @@ func doInit(src *sql.DB, dst *sql.DB, pair *model.SyncPair, level int) error {
 		}
 		dbParam := mapper.stringByName("param")
 		// through config params
-		for p := 0; p < len(pair.Params); p++ {
-			prm := validParam.FindStringSubmatch(pair.Params[p])
-			if prm[1] == dbParam {
+		for p := 0; p < len(pair.ColumnParam); p++ {
+			if dbParam == pair.ColumnParam[p].Param {
 				val := mapper.int64ByName("value")
-				pair.ParamValues[dbParam] = val // real deal
+				pair.ColumnParam[p].Value = val // real deal
 			}
 		}
 	}
@@ -224,7 +259,7 @@ type Mapper struct {
 }
 
 // NewMapper ...
-func NewMapper(rows *sql.Rows, mapping map[string]string, pv map[string]int64) (*Mapper, error) {
+func NewMapper(rows *sql.Rows, mapping map[string]string, pv []model.ColumnParamValue) (*Mapper, error) {
 	cols, err := rows.Columns()
 	if err != nil {
 		return nil, err
@@ -236,23 +271,48 @@ func NewMapper(rows *sql.Rows, mapping map[string]string, pv map[string]int64) (
 		mapper.Vals[i] = new(interface{})
 	}
 	mapper.Map = make(map[string]int)
+	for c := 0; c < len(cols); c++ {
+		col := cols[c]
+		dst, ok := mapping[col]
+		if ok {
+			mapper.Map[dst] = c
+		} else {
+			mapper.Map[col] = c
+		}
+	}
+	var notFound []string
 	for colsField, dstField := range mapping {
 		if colsField[:1] == "@" {
-			mapper.PVals = append(mapper.PVals, pv[colsField[1:]])
-			mapper.Map[dstField] = -len(mapper.PVals)
+			found := -1
+			for ii := 0; ii < len(pv); ii++ {
+				if pv[ii].Param == colsField[1:] {
+					found = ii
+					break
+				}
+			}
+			if found >= 0 {
+				mapper.PVals = append(mapper.PVals, pv[found].Value)
+				mapper.Map[dstField] = -len(mapper.PVals)
+			} else {
+				notFound = append(notFound, colsField)
+			}
 			continue
 		}
-		found := false
-		for c := 0; c < len(cols); c++ {
-			if colsField == cols[c] {
-				mapper.Map[dstField] = c
-				found = true
-				break
+		_, ok := mapper.Map[dstField]
+		if !ok {
+			notFound = append(notFound, colsField+"("+dstField+")")
+		}
+	}
+	if len(notFound) > 0 {
+		for i := 0; i < len(notFound); i++ {
+			if i == 0 {
+				fmt.Printf("\tMissing fields: ")
+			} else {
+				fmt.Printf(", ")
 			}
+			fmt.Printf("%s", notFound[i])
 		}
-		if !found {
-			fmt.Println(colsField, "not found")
-		}
+		fmt.Println("")
 	}
 	return mapper, nil
 }
@@ -321,65 +381,107 @@ func (m *Mapper) int64ByName(name string) int64 {
 	return 0
 }
 
-func buildQuery(pair *model.SyncPair) (query string) {
+func (m *Mapper) hasField(name string) bool {
+	_, ok := m.Map[name]
+	return ok
+}
+
+func buildQuery(pair *model.SyncPair) (query string, args []interface{}, outs []int64) {
 	switch *pair.Source.Type {
 	case "postgres":
 		query = "select * from " + *pair.Origin + "("
 		n := 0
-		for p := range pair.Params {
+		for p := range pair.ColumnParam {
 			if n > 0 {
 				query += ", "
 			}
-			prm := validParam.FindStringSubmatch(pair.Params[p])
-			val := pair.ParamValues[prm[1]]
-			query += strconv.FormatInt(val, 10)
+			query += strconv.FormatInt(pair.ColumnParam[p].Value, 10)
 			n++
 		}
 		query += ")"
 	case "mssql":
-		query = "EXEC " + *pair.Origin
-		n := 0
-		for p := range pair.Params {
-			if n > 0 {
-				query += ","
+		outs = make([]int64, len(pair.ColumnParam))
+		query = *pair.Origin
+		for p := range pair.ColumnParam {
+			var val interface{}
+			if pair.ColumnParam[p].BigEnd {
+				buf := make([]byte, 8)
+				binary.BigEndian.PutUint64(buf, uint64(pair.ColumnParam[p].Value))
+				val = buf
+			} else {
+				val = pair.ColumnParam[p].Value
 			}
-			prm := validParam.FindStringSubmatch(pair.Params[p])
-			val := pair.ParamValues[prm[1]]
-			query += " @" + prm[1] + "=" + strconv.FormatInt(val, 10)
-			n++
+			if pair.ColumnParam[p].Output {
+				outs[p] = pair.ColumnParam[p].Value
+				args = append(args, sql.Named(pair.ColumnParam[p].Param, sql.Out{Dest: &outs[p]}))
+			} else {
+				args = append(args, sql.Named(pair.ColumnParam[p].Param, val))
+			}
 		}
 	}
 	return
 }
 
-func storeData(dst *sql.DB, pair *model.SyncPair, recordset int, heap []interface{}, pv map[string]int64) error {
+func storeData(ctx context.Context, src *sql.DB, dst *sql.DB, pair *model.SyncPair, recordset int, heap []interface{}, pv []model.ColumnParamValue) error {
 
 	if recordset >= len(pair.Dest) {
 		fmt.Println("not enough Dest procedures (extra recordset(s) encountered) in", *pair.Origin)
 		return nil
 	}
+
+	var rows *sql.Rows
+	var err error
+
 	query := ""
 	switch *pair.Target.Type {
 	case "postgres":
-		query = "select * from " + *pair.Dest[recordset] + "($1, $2, $3)"
+		js, err := json.Marshal(heap)
+		if err != nil {
+			return err
+		}
+		query = "select * from " + *pair.Dest[recordset] + "($1)"
+		rows, err = dst.QueryContext(ctx, query, js)
 	case "mssql":
-		return errors.New("MS SQL is not supported as a target")
-	}
+		m := heap[0].(map[string]interface{})
+		// fix fields order
+		fields := make([]string, 0)
+		flds := make([]string, 0)
+		for k := range m {
+			fields = append(fields, "["+k+"]")
+			flds = append(flds, k)
+		}
+		if pair.TableType[recordset] != "" {
+			// call through table type
+			query += "DECLARE @tbl AS " + pair.TableType[recordset] + "\n"
+			// insert
+			query += "INSERT INTO @tbl (" + strings.Join(fields, ", ") + ")\n"
+			// select
+			query += "SELECT * FROM ( VALUES\n"
+			for i := range heap {
+				if i > 0 {
+					query += ","
+				}
+				m := heap[i].(map[string]interface{})
+				vals := valsTable(m, flds)
+				query += "(" + vals + ")\n"
+			}
+			query += ") t (" + strings.Join(fields, ", ") + ");\n"
+			query += "EXEC " + *pair.Dest[recordset] + " @tbl;"
+		} else {
+			// call with named parameters
+			for i := range heap {
+				m := heap[i].(map[string]interface{})
+				query += "EXEC " + *pair.Dest[recordset] + " " + valsList(m, flds) + ";\n"
+			}
+		}
+		rows, err = dst.QueryContext(ctx, query)
+	} // switch
 
-	js, err := json.Marshal(heap)
 	if err != nil {
 		return err
 	}
-	rvs, err := json.Marshal(pv)
-	if err != nil {
-		return err
-	}
-
-	// fmt.Printf("%s\n%s\n%s\n", query, string(js), string(rvs))
-
-	rows, err := dst.Query(query, js, rvs, pair.Origin)
-	if err != nil {
-		return err
+	if rows == nil {
+		return errors.New("rows == nil (probably destination proc does not exist)")
 	}
 	defer rows.Close()
 
@@ -389,7 +491,150 @@ func storeData(dst *sql.DB, pair *model.SyncPair, recordset int, heap []interfac
 		if err != nil {
 			return err
 		}
-		// fmt.Println(str)
+	}
+	err = rows.Err()
+	if err != nil {
+		return err
+	}
+
+	select {
+	default:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
+	return nil
+}
+
+func valsTable(m map[string]interface{}, fields []string) (query string) {
+	for f := 0; f < len(fields); f++ {
+		if f > 0 {
+			query += ","
+		}
+		v := m[fields[f]]
+		switch v.(type) {
+		case *interface{}:
+			vv := v.(*interface{})
+			v = *vv
+		}
+		query += valEncode(v)
+	}
+	return
+}
+
+func valsList(m map[string]interface{}, fields []string) (query string) {
+	for f := 0; f < len(fields); f++ {
+		if f > 0 {
+			query += ", "
+		}
+		v := m[fields[f]]
+		switch v.(type) {
+		case *interface{}:
+			vv := v.(*interface{})
+			v = *vv
+		}
+		val := "@" + fields[f] + "=" + valEncode(v)
+		query += val
+	}
+	return
+}
+
+func valEncode(v interface{}) (val string) {
+	switch v.(type) {
+	case int8, uint8,
+		int16, uint16,
+		int32, uint32,
+		int64, uint64,
+		float32, float64:
+		val = fmt.Sprintf("%v", v)
+	case string:
+		val = fmt.Sprintf("'%v'", strings.Replace(v.(string), "'", "''", -1))
+	case bool:
+		if v.(bool) {
+			val = "1"
+		} else {
+			val = "0"
+		}
+	case time.Time:
+		val = fmt.Sprintf("'%s'", (v.(time.Time)).Format("2006-01-02 15:04:05"))
+	default:
+		val = "null"
+	}
+	return
+}
+
+func storeRV(ctx context.Context, src *sql.DB, dst *sql.DB, pair *model.SyncPair, pv []model.ColumnParamValue) error {
+
+	changes := false
+	for i := 0; i < len(pv) && !changes; i++ {
+		if pv[i].Value != pair.ColumnParam[i].Value {
+			changes = true
+		}
+	}
+	if !changes {
+		return nil
+	}
+
+	var sync *sql.DB
+	if pair.SyncTableSide == "src" {
+		sync = src
+	} else {
+		sync = dst
+	}
+	prms := ""
+	for i := 0; i < len(pair.ColumnParam); i++ {
+		if len(prms) > 0 {
+			prms += ","
+		}
+		prms += "'" + pair.ColumnParam[i].Param + "'"
+	}
+	if pair.SyncTable == nil || pair.Origin == nil {
+		println("err")
+	}
+	query := "select param, value from " + *pair.SyncTable + " where tbl = '" + *pair.Origin + "' and param in (" + prms + ")"
+	rows, err := sync.QueryContext(ctx, query)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	mapper, err := NewMapper(rows, map[string]string{"param": "param", "value": "value"}, nil)
+	if err != nil {
+		return err
+	}
+
+	saved := make(map[string]bool)
+	for rows.Next() {
+		err = rows.Scan(mapper.Vals...)
+		if err != nil {
+			return err
+		}
+		// seek RV in memory
+		for i := range pv {
+			if pv[i].Param == mapper.stringByName("param") {
+				sql := "update " + *pair.SyncTable + " set value = " + strconv.FormatInt(pv[i].Value, 10) + " where tbl = '" + *pair.Origin + "' and param = '" + pv[i].Param + "'"
+				_, err := sync.Exec(sql)
+				if err != nil {
+					return err
+				}
+				saved[pv[i].Param] = true
+			}
+		}
+	}
+	err = rows.Err()
+	if err != nil {
+		return err
+	}
+	// insert absent
+	for i := range pv {
+		if _, ok := saved[pv[i].Param]; ok {
+			continue
+		}
+		sql := "insert into " + *pair.SyncTable + " (tbl, param, value) values ('" + *pair.Origin + "','" + pv[i].Param + "'," + strconv.FormatInt(pv[i].Value, 10) + ")"
+		_, err := sync.Exec(sql)
+		if err != nil {
+			return err
+		}
 	}
 
 	return nil

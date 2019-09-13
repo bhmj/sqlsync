@@ -31,7 +31,6 @@ func ReadConfig(fname string) (cfg *model.Settings, err error) {
 
 // ValidateConfig ...
 func ValidateConfig(cfg *model.Settings) error {
-	validParam := regexp.MustCompile(`^([A-z,a-z,_]+)=([A-z,a-z,_]+)$`)
 
 	for i := 0; i < len(cfg.Sync); i++ {
 		conns, err := CheckPair(cfg.Sync[i].Source, cfg.Sync[i].Target, cfg.Source, cfg.Target)
@@ -58,11 +57,8 @@ func ValidateConfig(cfg *model.Settings) error {
 				cfg.Sync[i].TargetLink = &cfg.Link[found]
 			}
 		}
-		for p := 0; p < len(cfg.Sync[i].Params); p++ {
-			if !validParam.MatchString(cfg.Sync[i].Params[p]) {
-				return fmt.Errorf("invalid param %s", cfg.Sync[i].Params[p])
-			}
-		}
+		// TODO: validate params
+		// propagate connections to row proc
 		for p := 0; p < len(cfg.Sync[i].RowProc); p++ {
 			for s := 0; s < len(cfg.Sync[i].RowProc[p].Sync); s++ {
 				sub := &cfg.Sync[i].RowProc[p].Sync[s]
@@ -72,6 +68,40 @@ func ValidateConfig(cfg *model.Settings) error {
 				sub.TargetLink = cfg.Sync[i].TargetLink
 			}
 		}
+		// sync table parsing
+		s := "sync.sqlsync"
+		if cfg.Sync[i].SyncTable != nil {
+			v1 := regexp.MustCompile(`^(src|dst)\.([\w\.]+)$`)
+			v2 := regexp.MustCompile(`^(src|dst)$`)
+			v3 := regexp.MustCompile(`^[\w+\.]+$`)
+			if v1.MatchString(*cfg.Sync[i].SyncTable) {
+				tokens := v1.FindStringSubmatch(*cfg.Sync[i].SyncTable)
+				cfg.Sync[i].SyncTableSide = tokens[1]
+				cfg.Sync[i].SyncTable = &tokens[2]
+			} else if v2.MatchString(*cfg.Sync[i].SyncTable) {
+				tokens := v2.FindStringSubmatch(*cfg.Sync[i].SyncTable)
+				cfg.Sync[i].SyncTableSide = tokens[0]
+				cfg.Sync[i].SyncTable = &s
+			} else if v3.MatchString(*cfg.Sync[i].SyncTable) {
+				tokens := v2.FindStringSubmatch(*cfg.Sync[i].SyncTable)
+				cfg.Sync[i].SyncTableSide = "dst"
+				cfg.Sync[i].SyncTable = &tokens[0]
+			} else {
+				return fmt.Errorf("invalid SyncTable: %s", *cfg.Sync[i].SyncTable)
+			}
+		}
+		// MS SQL table type support
+		cfg.Sync[i].TableType = make([]string, len(cfg.Sync[i].Dest))
+		mstt := regexp.MustCompile(`^([\w\.]+)\s+(@([\w\.]+))$`)
+		for d := 0; d < len(cfg.Sync[i].Dest); d++ {
+			if mstt.MatchString(*cfg.Sync[i].Dest[d]) {
+				tokens := mstt.FindStringSubmatch(*cfg.Sync[i].Dest[d])
+				cfg.Sync[i].Dest[d] = &tokens[1]
+				cfg.Sync[i].TableType[d] = tokens[3]
+			}
+		}
+		// TODO: validate ColumnParam in RowProc to 1) non-nil 2) match column names to parent column set
+		// TODO: validate Mapping in RowProc for @ columns to match to params
 	}
 	return nil
 }

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
@@ -15,11 +16,15 @@ import (
 func main() {
 
 	configFile := flag.String("config", "", "path to config file")
+	quietMode := flag.Bool("quiet", false, "do not write sync statistics")
 	flag.Parse()
 	if configFile == nil || *configFile == "" || !FileExists(*configFile) {
 		fmt.Fprintf(os.Stderr, "Usage: sqlsync [params] \n")
 		flag.PrintDefaults()
 		return
+	}
+	if *quietMode {
+		fmt.Println("quiet mode")
 	}
 
 	settings, err := config.ReadConfig(*configFile)
@@ -28,7 +33,14 @@ func main() {
 		return
 	}
 
+	// init RVs
+	for i := 0; i < len(settings.Sync); i++ {
+		syncer.Init(&settings.Sync[i])
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
 	errs := make(chan error, 32)
+	shutdown := make(chan bool, 1)
 
 	go func() {
 		c := make(chan os.Signal, 1)
@@ -36,16 +48,12 @@ func main() {
 		errs <- fmt.Errorf("%s", <-c)
 	}()
 
-	shutdown := make(chan bool, 1)
 	go func() {
-		fmt.Printf("\nbegin shutdown: %v\n", <-errs)
+		fmt.Printf("\nshutting down on %v\n", <-errs)
+		cancel()
+		time.Sleep(200 * time.Millisecond)
 		shutdown <- true
 	}()
-
-	// init RVs
-	for i := 0; i < len(settings.Sync); i++ {
-		syncer.Init(&settings.Sync[i])
-	}
 
 	jobs := make(chan int)
 
@@ -65,7 +73,7 @@ func main() {
 			fmt.Println("terminated")
 			os.Exit(0)
 		case sync := <-jobs:
-			syncer.DoSync(&settings.Sync[sync])
+			go syncer.DoSync(ctx, &settings.Sync[sync], *quietMode)
 		}
 	}
 }

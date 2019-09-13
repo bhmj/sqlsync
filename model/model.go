@@ -29,25 +29,35 @@ type SideOrigin struct {
 	Sync      []SyncPair // Params contain params for origin proc
 }
 
+// ColumnParamValue ...
+type ColumnParamValue struct {
+	Column string
+	Param  string
+	Value  int64
+	BigEnd bool
+	Output bool
+}
+
 // SyncPair represents a single job
 type SyncPair struct {
+	sync.Mutex
 	Source DBServer // optional
 	Target DBServer // optional
 	//
-	Origin  *string           // source proc
-	Dest    []*string         // destination proc
-	Params  []string          // params for origin proc ("param=column")
-	Mapping map[string]string // origin -> dest field mapping (field -> field)
-	RowProc []SideOrigin      // proc to call for every row (on condition)
+	Origin      *string            // source proc
+	Dest        []*string          // destination proc
+	ColumnParam []ColumnParamValue // params for origin proc ("column => param (value)")
+	Mapping     map[string]string  // origin -> dest field mapping (field -> field)
+	RowProc     []SideOrigin       // proc to call for every row (on condition)
 	//
 	SourceLink *DBConnection
 	TargetLink *DBConnection
 	//
 	Period Duration
 	//
-	ParamValues map[string]int64  // runtime
-	ParamColumn map[string]string // runtime
-	SyncTable   *string           // RV table on Target. Default is sync.sqlsync (tbl varchar, param varchar, val bigint)
+	SyncTable     *string  // RV table name & location. Default is dst.sync.sqlsync (tbl varchar, param varchar, val bigint)
+	SyncTableSide string   // runtime: src or dst
+	TableType     []string // runtime: table type
 }
 
 // Settings holds all the parameters for the syncer
